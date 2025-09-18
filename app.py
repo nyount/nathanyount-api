@@ -6,11 +6,11 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-# ====== ENV ======
-GOODREADS_RSS = os.environ.get("GOODREADS_RSS")  # updates feed (optional)
-GOODREADS_READ_RSS = os.environ.get("GOODREADS_READ_RSS")  # "read" shelf feed
+# ---------- ENV ----------
+GOODREADS_RSS = os.environ.get("GOODREADS_RSS")                  # updates feed (optional)
+GOODREADS_READ_RSS = os.environ.get("GOODREADS_READ_RSS")        # read-shelf feed (required for /books/finished)
 
-# ====== HTTP fetch with browser-ish headers (Goodreads blocks default UA) ======
+# ---------- HTTP (browser-ish headers to avoid 403) ----------
 UA_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
@@ -24,24 +24,20 @@ def _fetch_and_parse(url: str):
     xml = _fetch_text(url)
     return feedparser.parse(xml)
 
-# ====== BASIC HEALTH ======
+# ---------- HEALTH ----------
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "API is alive"}
+    return {"status": "ok"}
 
-# ====== DEBUG RAW FEED (works now for you) ======
+# ---------- DEBUG RAW (read shelf) ----------
 @app.get("/books/finished/raw")
 def books_finished_raw():
-    url = os.environ.get("GOODREADS_READ_RSS", "")
-    if not url:
+    if not GOODREADS_READ_RSS:
         return {"error": "GOODREADS_READ_RSS missing"}, 500
-    try:
-        xml = _fetch_text(url)
-        return {"status": 200, "len": len(xml), "snippet": xml[:2000]}
-    except requests.HTTPError as e:
-        return {"status": e.response.status_code, "error": str(e)}
+    xml = _fetch_text(GOODREADS_READ_RSS)
+    return {"status": 200, "len": len(xml), "snippet": xml[:2000]}
 
-# ====== RECENT UPDATES (noisy feed) ======
+# ---------- RECENT (updates feed) ----------
 @app.get("/books/recent")
 def books_recent():
     if not GOODREADS_RSS:
@@ -57,17 +53,16 @@ def books_recent():
         })
     return jsonify({"count": len(items), "items": items})
 
-# ====== FINISHED BOOKS (read shelf → table data) ======
+# ---------- FINISHED (read shelf -> normalized rows) ----------
 LABELS = {
     "author":   ["author_name", "author"],
     "rating":   ["user_rating", "rating"],
-    "finished": ["read_at", "date_read", "user_read_at"],             # primary signals
-    "fallback": ["user_date_updated", "date_updated", "user_date_added", "date_added", "pubdate"],  # fallbacks
+    "finished": ["read_at", "date_read", "user_read_at"],
+    "fallback": ["user_date_updated", "date_updated", "user_date_added", "date_added", "pubdate"],
     "review":   ["review", "review_text"],
 }
 
 def _grab_label(text, labels):
-    import re
     for lab in labels:
         m = re.search(rf"{lab}\s*:\s*(.*)", text, flags=re.IGNORECASE)
         if m:
@@ -76,32 +71,24 @@ def _grab_label(text, labels):
 
 def _norm_date(s):
     if not s: return ""
-    return s.replace("/", "-").strip()  # normalize 2025/04/16 -> 2025-04-16
+    return s.replace("/", "-").strip()
 
 def _pick_finished(text, entry):
-    """Try multiple places for a finished date; fall back if needed."""
-    # 1) From the description blob (our main path)
     primary = _grab_label(text, LABELS["finished"])
     if primary:
         return _norm_date(primary)
-
-    # 2) Namespaced keys that feedparser might keep on entry (best effort)
     for k in ["user_read_at", "read_at", "date_read", "gr_read_at", "gr_date_read", "user_date_read"]:
         v = entry.get(k)
         if v:
             return _norm_date(str(v))
-
-    # 3) Fallbacks (approximate “finished” as last update)
     fallback = _grab_label(text, LABELS["fallback"])
     if fallback:
         return _norm_date(fallback)
-
     for k in ["user_date_updated", "date_updated", "user_date_added", "date_added", "published"]:
         v = entry.get(k)
         if v:
             return _norm_date(str(v))
-
-    return ""  # truly nothing found
+    return ""
 
 _cache = {"books_read": None, "ts": 0, "ttl": 15*60}
 
@@ -119,13 +106,11 @@ def _parse_read_shelf(feed_url, limit=100):
         rating = _grab_label(text, LABELS["rating"])
         review = _grab_label(text, LABELS["review"])
 
-        # normalize rating
         if rating and rating.isdigit():
             rating = int(rating)
             if rating == 0:
                 rating = ""
 
-        # strip " by Author" if present
         if " by " in title and author:
             title = title.split(" by ")[0].strip()
 
@@ -134,7 +119,7 @@ def _parse_read_shelf(feed_url, limit=100):
         out.append({
             "title": title,
             "author": author,
-            "finished_at": finished_at,   # may be fallback if read_at missing
+            "finished_at": finished_at,
             "rating": rating,
             "review": review,
             "link": link,
@@ -151,15 +136,9 @@ def books_finished():
         items = _cache["books_read"]
     else:
         items = _parse_read_shelf(GOODREADS_READ_RSS, limit=100)
-
-        # since the feed is **shelf=read**, treat all as finished;
-        # only drop ones that truly have no date info *if you want to*
-        # (comment out the next line if you want to keep absolutely everything)
+        # If you only want rows with a date, uncomment the next line later.
         # items = [it for it in items if it["finished_at"]]
-
-        # Sort newest-first by finished_at (fallback entries with "" will sort last)
         items.sort(key=lambda it: it["finished_at"] or "", reverse=True)
-
         _cache["books_read"] = items
         _cache["ts"] = now
 
