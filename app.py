@@ -56,7 +56,7 @@ def books_recent():
 # ---------- FINISHED (read shelf -> normalized rows) ----------
 LABELS = {
     "author":   ["author_name", "author"],
-    "rating":   ["user_rating", "rating"],
+    "rating":   ["user_rating"],    #, "rating"
     "finished": ["read_at", "date_read", "user_read_at"],
     "fallback": ["user_date_updated", "date_updated", "user_date_added", "date_added", "pubdate"],
     "review":   ["review", "review_text"],
