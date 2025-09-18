@@ -1,16 +1,17 @@
+# app.py
 import os, time, re, requests, feedparser
 from bs4 import BeautifulSoup
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
+from dateutil import parser as dtparse  # robust date parsing
 
 app = Flask(__name__)
 CORS(app)
 
-# ---------- ENV ----------
-GOODREADS_RSS = os.environ.get("GOODREADS_RSS")                  # updates feed (optional)
-GOODREADS_READ_RSS = os.environ.get("GOODREADS_READ_RSS")        # read-shelf feed (required for /books/finished)
+# ---- ENV ----
+GOODREADS_READ_RSS = os.environ.get("GOODREADS_READ_RSS")
 
-# ---------- HTTP (browser-ish headers to avoid 403) ----------
+# ---- HTTP (browser-like headers; GR blocks default UA) ----
 UA_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
@@ -24,75 +25,75 @@ def _fetch_and_parse(url: str):
     xml = _fetch_text(url)
     return feedparser.parse(xml)
 
-# ---------- HEALTH ----------
-@app.get("/")
-def root():
-    return {"status": "ok"}
+# ---- helpers ----
+def _grab_user_rating(desc_text: str, entry) -> int | str:
+    """
+    Return YOUR rating (0..5) as int, or '' if unrated.
+    Never fall back to average rating.
+    """
+    m = re.search(r"user[\s_-]*rating\s*:\s*([0-5])\b", desc_text, flags=re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    # sometimes feedparser keeps namespaced keys
+    for k, v in entry.items():
+        lk = k.lower()
+        if "user" in lk and "rating" in lk:
+            if isinstance(v, (int, float)) and 0 <= v <= 5:
+                return int(v)
+            m2 = re.search(r"\b([0-5])\b", str(v))
+            if m2:
+                return int(m2.group(1))
+    return ""  # unrated
 
-# ---------- DEBUG RAW (read shelf) ----------
-@app.get("/books/finished/raw")
-def books_finished_raw():
-    if not GOODREADS_READ_RSS:
-        return {"error": "GOODREADS_READ_RSS missing"}, 500
-    xml = _fetch_text(GOODREADS_READ_RSS)
-    return {"status": 200, "len": len(xml), "snippet": xml[:2000]}
+def _pick_finished_date(desc_text: str, entry) -> tuple[str, int]:
+    """
+    Find 'date read' robustly. Return:
+      - finished_at (YYYY-MM-DD or '')
+      - finished_ts (unix epoch int; 0 if unknown)
+    """
+    # 1) Look for likely labels in description blob
+    for lab in ("read_at", "date_read", "user_read_at"):
+        m = re.search(rf"{lab}\s*:\s*(.+)", desc_text, flags=re.IGNORECASE)
+        if m and m.group(1).strip():
+            raw = m.group(1).strip()
+            dt = _to_dt(raw)
+            if dt:
+                return dt.date().isoformat(), int(dt.timestamp())
 
-# ---------- RECENT (updates feed) ----------
-@app.get("/books/recent")
-def books_recent():
-    if not GOODREADS_RSS:
-        return jsonify({"error": "GOODREADS_RSS not configured"}), 500
-    feed = _fetch_and_parse(GOODREADS_RSS)
-    items = []
-    for e in feed.entries[:10]:
-        items.append({
-            "title": e.get("title"),
-            "link": e.get("link"),
-            "published": e.get("published"),
-            "summary": e.get("summary"),
-        })
-    return jsonify({"count": len(items), "items": items})
-
-# ---------- FINISHED (read shelf -> normalized rows) ----------
-LABELS = {
-    "author":   ["author_name", "author"],
-    "rating":   ["user_rating"],    #, "rating"
-    "finished": ["read_at", "date_read", "user_read_at"],
-    "fallback": ["user_date_updated", "date_updated", "user_date_added", "date_added", "pubdate"],
-    "review":   ["review", "review_text"],
-}
-
-def _grab_label(text, labels):
-    for lab in labels:
-        m = re.search(rf"{lab}\s*:\s*(.*)", text, flags=re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
-    return ""
-
-def _norm_date(s):
-    if not s: return ""
-    return s.replace("/", "-").strip()
-
-def _pick_finished(text, entry):
-    primary = _grab_label(text, LABELS["finished"])
-    if primary:
-        return _norm_date(primary)
-    for k in ["user_read_at", "read_at", "date_read", "gr_read_at", "gr_date_read", "user_date_read"]:
+    # 2) Check entry keys
+    for k in ("user_read_at", "read_at", "date_read", "gr_read_at", "gr_date_read", "user_date_read"):
         v = entry.get(k)
         if v:
-            return _norm_date(str(v))
-    fallback = _grab_label(text, LABELS["fallback"])
-    if fallback:
-        return _norm_date(fallback)
-    for k in ["user_date_updated", "date_updated", "user_date_added", "date_added", "published"]:
-        v = entry.get(k)
+            dt = _to_dt(str(v))
+            if dt:
+                return dt.date().isoformat(), int(dt.timestamp())
+
+    # 3) Fallbacks (approximate “finished” as last update)
+    for lab in ("user_date_updated", "date_updated", "user_date_added", "date_added", "pubdate", "published"):
+        m = re.search(rf"{lab}\s*:\s*(.+)", desc_text, flags=re.IGNORECASE)
+        if m and m.group(1).strip():
+            dt = _to_dt(m.group(1).strip())
+            if dt:
+                return dt.date().isoformat(), int(dt.timestamp())
+
+        v = entry.get(lab)
         if v:
-            return _norm_date(str(v))
-    return ""
+            dt = _to_dt(str(v))
+            if dt:
+                return dt.date().isoformat(), int(dt.timestamp())
 
-_cache = {"books_read": None, "ts": 0, "ttl": 15*60}
+    return "", 0  # unknown
 
-def _parse_read_shelf(feed_url, limit=100):
+def _to_dt(s: str):
+    try:
+        return dtparse.parse(s)
+    except Exception:
+        return None
+
+# tiny cache
+_CACHE = {"items": None, "ts": 0, "ttl": 15 * 60}
+
+def _parse_finished(feed_url: str, limit: int = 200):
     feed = _fetch_and_parse(feed_url)
     out = []
     for e in feed.entries[:limit]:
@@ -102,46 +103,70 @@ def _parse_read_shelf(feed_url, limit=100):
 
         title = (e.get("title") or "").strip()
         link = e.get("link")
-        author = _grab_label(text, LABELS["author"])
-        rating = _grab_label(text, LABELS["rating"])
-        review = _grab_label(text, LABELS["review"])
+        # extract author from description; fall back to stripping " by ..."
+        m_auth = re.search(r"(?:author|author_name)\s*:\s*(.+)", text, flags=re.IGNORECASE)
+        author = m_auth.group(1).strip() if m_auth else ""
+        if not author and " by " in title:
+            # many GR titles look like "Title by Author"
+            maybe_title, maybe_author = title.split(" by ", 1)
+            title, author = maybe_title.strip(), maybe_author.strip()
 
-        if rating and rating.isdigit():
-            rating = int(rating)
-            if rating == 0:
-                rating = ""
+        rating = _grab_user_rating(text, e)  # YOUR rating only
+        finished_at, finished_ts = _pick_finished_date(text, e)
 
-        if " by " in title and author:
-            title = title.split(" by ")[0].strip()
-
-        finished_at = _pick_finished(text, e)
+        # clean rating: 0 -> '' (unrated)
+        if rating == 0:
+            rating = ""
 
         out.append({
             "title": title,
             "author": author,
-            "finished_at": finished_at,
-            "rating": rating,
-            "review": review,
+            "finished_at": finished_at,   # for display (YYYY-MM-DD)
+            "finished_ts": finished_ts,   # for sorting (int)
+            "rating": rating,             # 1..5 or ''
+            "review": _extract_review(text),
             "link": link,
         })
     return out
 
-@app.get("/books/finished")
-def books_finished():
+def _extract_review(text: str) -> str:
+    m = re.search(r"(?:^|\n)review\s*:\s*(.*)", text, flags=re.IGNORECASE | re.DOTALL)
+    return m.group(1).strip() if m else ""
+
+# ---- routes ----
+@app.get("/", strict_slashes=False)
+def health():
+    return {"status": "ok"}
+
+@app.get("/books/finished/raw", strict_slashes=False)
+def finished_raw():
+    if not GOODREADS_READ_RSS:
+        return {"error": "GOODREADS_READ_RSS missing"}, 500
+    xml = _fetch_text(GOODREADS_READ_RSS)
+    return {"status": 200, "len": len(xml), "snippet": xml[:2000]}
+
+@app.get("/books/finished", strict_slashes=False)
+def finished():
     if not GOODREADS_READ_RSS:
         return jsonify({"error": "GOODREADS_READ_RSS not configured"}), 500
 
-    now = time.time()
-    if _cache["books_read"] and now - _cache["ts"] < _cache["ttl"]:
-        items = _cache["books_read"]
-    else:
-        items = _parse_read_shelf(GOODREADS_READ_RSS, limit=100)
-        # If you only want rows with a date, uncomment the next line later.
-        # items = [it for it in items if it["finished_at"]]
-        items.sort(key=lambda it: it["finished_at"] or "", reverse=True)
-        _cache["books_read"] = items
-        _cache["ts"] = now
+    # dev switch: ?nocache=1 to force refresh
+    if request.args.get("nocache"):
+        _CACHE["ts"] = 0
 
+    now = time.time()
+    if _CACHE["items"] and now - _CACHE["ts"] < _CACHE["ttl"]:
+        items = _CACHE["items"]
+    else:
+        items = _parse_finished(GOODREADS_READ_RSS, limit=200)
+        # If you only want rows with an actual finished date, uncomment:
+        # items = [it for it in items if it["finished_ts"] > 0]
+        items.sort(key=lambda it: it.get("finished_ts", 0), reverse=True)  # NEWEST first
+        _CACHE["items"] = items
+        _CACHE["ts"] = now
+
+    # Optional: trim to top N here (or handle on frontend)
+    # items = items[:20]
     return jsonify({"items": items})
 
 if __name__ == "__main__":
