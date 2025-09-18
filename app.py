@@ -134,11 +134,30 @@ def books_finished():
     _cache["ts"] = now
     return jsonify({"items": items})
 
+import requests
+import feedparser
+
+UA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
+}
+
+def _fetch_text(url: str) -> str:
+    r = requests.get(url, headers=UA_HEADERS, timeout=15)
+    r.raise_for_status()
+    return r.text
+
+def _fetch_and_parse(url: str):
+    xml = _fetch_text(url)
+    return feedparser.parse(xml)
+
 @app.get("/books/finished/raw")
 def books_finished_raw():
-    import requests
     url = os.environ.get("GOODREADS_READ_RSS", "")
     if not url:
         return {"error": "GOODREADS_READ_RSS missing"}, 500
-    r = requests.get(url, timeout=15)
-    return {"status": r.status_code, "len": len(r.text), "snippet": r.text[:2000]}
+    try:
+        xml = _fetch_text(url)
+        return {"status": 200, "len": len(xml), "snippet": xml[:2000]}
+    except requests.HTTPError as e:
+        return {"status": e.response.status_code, "error": str(e)}
