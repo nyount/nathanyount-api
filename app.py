@@ -133,3 +133,12 @@ def books_finished():
     _cache["books_read"] = items
     _cache["ts"] = now
     return jsonify({"items": items})
+
+@app.get("/books/finished/raw")
+def books_finished_raw():
+    import requests
+    url = os.environ.get("GOODREADS_READ_RSS", "")
+    if not url:
+        return {"error": "GOODREADS_READ_RSS missing"}, 500
+    r = requests.get(url, timeout=15)
+    return {"status": r.status_code, "len": len(r.text), "snippet": r.text[:2000]}
