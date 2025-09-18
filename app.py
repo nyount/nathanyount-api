@@ -61,20 +61,47 @@ def books_recent():
 LABELS = {
     "author":   ["author_name", "author"],
     "rating":   ["user_rating", "rating"],
-    "finished": ["read_at", "date_read", "user_read_at"],
+    "finished": ["read_at", "date_read", "user_read_at"],             # primary signals
+    "fallback": ["user_date_updated", "date_updated", "user_date_added", "date_added", "pubdate"],  # fallbacks
     "review":   ["review", "review_text"],
 }
 
 def _grab_label(text, labels):
+    import re
     for lab in labels:
         m = re.search(rf"{lab}\s*:\s*(.*)", text, flags=re.IGNORECASE)
         if m:
             return m.group(1).strip()
     return ""
 
-def _normalize_date(s):
+def _norm_date(s):
     if not s: return ""
-    return s.replace("/", "-").strip()  # Goodreads often YYYY/MM/DD
+    return s.replace("/", "-").strip()  # normalize 2025/04/16 -> 2025-04-16
+
+def _pick_finished(text, entry):
+    """Try multiple places for a finished date; fall back if needed."""
+    # 1) From the description blob (our main path)
+    primary = _grab_label(text, LABELS["finished"])
+    if primary:
+        return _norm_date(primary)
+
+    # 2) Namespaced keys that feedparser might keep on entry (best effort)
+    for k in ["user_read_at", "read_at", "date_read", "gr_read_at", "gr_date_read", "user_date_read"]:
+        v = entry.get(k)
+        if v:
+            return _norm_date(str(v))
+
+    # 3) Fallbacks (approximate “finished” as last update)
+    fallback = _grab_label(text, LABELS["fallback"])
+    if fallback:
+        return _norm_date(fallback)
+
+    for k in ["user_date_updated", "date_updated", "user_date_added", "date_added", "published"]:
+        v = entry.get(k)
+        if v:
+            return _norm_date(str(v))
+
+    return ""  # truly nothing found
 
 _cache = {"books_read": None, "ts": 0, "ttl": 15*60}
 
@@ -90,7 +117,6 @@ def _parse_read_shelf(feed_url, limit=100):
         link = e.get("link")
         author = _grab_label(text, LABELS["author"])
         rating = _grab_label(text, LABELS["rating"])
-        finished_at = _normalize_date(_grab_label(text, LABELS["finished"]))
         review = _grab_label(text, LABELS["review"])
 
         # normalize rating
@@ -99,14 +125,16 @@ def _parse_read_shelf(feed_url, limit=100):
             if rating == 0:
                 rating = ""
 
-        # strip " by Author" from title if present
+        # strip " by Author" if present
         if " by " in title and author:
             title = title.split(" by ")[0].strip()
+
+        finished_at = _pick_finished(text, e)
 
         out.append({
             "title": title,
             "author": author,
-            "finished_at": finished_at,
+            "finished_at": finished_at,   # may be fallback if read_at missing
             "rating": rating,
             "review": review,
             "link": link,
@@ -123,9 +151,15 @@ def books_finished():
         items = _cache["books_read"]
     else:
         items = _parse_read_shelf(GOODREADS_READ_RSS, limit=100)
-        # keep only entries with an actual finished date
-        items = [it for it in items if it["finished_at"]]
-        items.sort(key=lambda it: it["finished_at"], reverse=True)
+
+        # since the feed is **shelf=read**, treat all as finished;
+        # only drop ones that truly have no date info *if you want to*
+        # (comment out the next line if you want to keep absolutely everything)
+        # items = [it for it in items if it["finished_at"]]
+
+        # Sort newest-first by finished_at (fallback entries with "" will sort last)
+        items.sort(key=lambda it: it["finished_at"] or "", reverse=True)
+
         _cache["books_read"] = items
         _cache["ts"] = now
 
